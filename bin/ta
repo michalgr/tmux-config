@@ -1,18 +1,154 @@
 #!/usr/bin/env bash
-# Attach to an existing tmux session by name or create a new one if it doesn't exist
+# Attach to, switch, create, or kill tmux sessions via an interactive fzf browser
+# or directly by session name when passed as an argument.
 
-if [ -z "$1" ]; then
-  if [ -n "$TMUX" ]; then
-    tmux switch-client -l 2>/dev/null || tmux list-sessions
-  else
-    tmux attach-session 2>/dev/null || exec tmux new-session
+set -euo pipefail
+
+current_session() {
+  if [ -n "${TMUX:-}" ]; then
+    local s=""
+    s="$(tmux display-message -p '#{client_session}' 2>/dev/null || true)"
+    if [ -z "$s" ] && [ -n "${TMUX_PANE:-}" ]; then
+      s="$(tmux display-message -p -t "$TMUX_PANE" '#S' 2>/dev/null || true)"
+    fi
+    printf "%s" "$s"
   fi
-elif [ -n "$TMUX" ]; then
-  session="$1"
-  tmux has-session -t "$session" 2>/dev/null || tmux new-session -d -s "$session"
-  tmux switch-client -t "$session"
-else
-  session="$1"
-  shift
-  exec tmux new-session -A -s "$session" "$@"
+}
+
+list_sessions() {
+  local current
+  current="$(current_session)"
+
+  tmux list-sessions -F '#{?session_last_attached,#{session_last_attached},0} #{session_name}' 2>/dev/null \
+    | sort -rn \
+    | awk -v cur="$current" '
+        {
+          sub(/^[0-9]+ /, "")
+          if ($0 == cur) {
+            has_cur = 1
+          } else {
+            print $0
+          }
+        }
+        END {
+          if (has_cur) print cur
+        }
+      ' || true
+}
+
+preview_session() {
+  local session="${1:-}"
+  local query="${2:-}"
+
+  if [ -n "$session" ] && tmux has-session -t "=$session" 2>/dev/null; then
+    tmux capture-pane -ep -t "=$session:"
+  elif [ -n "$query" ]; then
+    printf "Press Ctrl-N to create session: %s\n" "$query"
+  else
+    printf "Press Ctrl-N to create a new session\n"
+  fi
+}
+
+kill_target_session() {
+  local target="${1:-}"
+  [ -z "$target" ] && return 0
+
+  if [ -n "${TMUX:-}" ]; then
+    local current
+    current="$(current_session)"
+    if [ "$target" = "$current" ]; then
+      tmux switch-client -l 2>/dev/null || tmux switch-client -n 2>/dev/null || true
+    fi
+  fi
+
+  tmux kill-session -t "=$target" 2>/dev/null || true
+}
+
+attach_existing() {
+  local session="${1:-}"
+  [ -z "$session" ] && return 0
+
+  if [ -n "${TMUX:-}" ]; then
+    tmux switch-client -t "=$session"
+  else
+    exec tmux attach-session -t "=$session"
+  fi
+}
+
+attach_or_create() {
+  local session="${1:-}"
+  shift || true
+
+  if [ -z "$session" ]; then
+    if [ -n "${TMUX:-}" ]; then
+      session="$(tmux new-session -d -P -F '#{session_name}')"
+      attach_existing "$session"
+    else
+      exec tmux new-session
+    fi
+  elif [ -n "${TMUX:-}" ]; then
+    tmux has-session -t "=$session" 2>/dev/null || tmux new-session -d -s "$session"
+    attach_existing "$session"
+  else
+    exec tmux new-session -A -s "$session" "$@"
+  fi
+}
+
+case "${1:-}" in
+  --list)
+    list_sessions
+    exit 0
+    ;;
+  --preview)
+    preview_session "${2:-}" "${3:-}"
+    exit 0
+    ;;
+  --kill)
+    kill_target_session "${2:-}"
+    exit 0
+    ;;
+esac
+
+if [ $# -gt 0 ]; then
+  attach_or_create "$@"
+  exit 0
 fi
+
+self="$(cd "$(dirname "$0")" && pwd)/$(basename "$0")"
+
+set +e
+fzf_out="$(
+  list_sessions | fzf \
+    --reverse \
+    --print-query \
+    --expect=ctrl-n \
+    --prompt="Session > " \
+    --header="Enter: switch | Ctrl-N: new session | Ctrl-X/Ctrl-D: kill session" \
+    --preview-window="right:65%" \
+    --preview="\"$self\" --preview {} {q}" \
+    --bind="ctrl-x:execute-silent(\"$self\" --kill {})+reload(\"$self\" --list)" \
+    --bind="ctrl-d:execute-silent(\"$self\" --kill {})+reload(\"$self\" --list)"
+)"
+fzf_rc=$?
+set -e
+
+# Exit code 130 means interrupted (Esc / Ctrl-C); 2 means fzf error
+if [ "$fzf_rc" -eq 130 ] || [ "$fzf_rc" -eq 2 ]; then
+  exit 0
+fi
+
+query=""
+key=""
+selected=""
+{
+  IFS= read -r query || true
+  IFS= read -r key || true
+  IFS= read -r selected || true
+} <<< "$fzf_out"
+
+if [ "$key" = "ctrl-n" ]; then
+  attach_or_create "$query"
+elif [ -n "$selected" ]; then
+  attach_existing "$selected"
+fi
+
